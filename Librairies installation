@@ -1,0 +1,26 @@
+import subprocess
+import sys
+
+# List of required packages
+required_packages = [
+    "requests",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "geopandas",
+    "contextily",
+    "reportlab",
+    "numpy-financial"
+]
+
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Check and install missing packages
+for package in required_packages:
+    try:
+        # Replace hyphens with underscores for import names (e.g., numpy-financial -> numpy_financial)
+        __import__(package.replace("-", "_"))
+    except ImportError:
+        print(f"Package '{package}' not found. Installing...")
+        install(package)

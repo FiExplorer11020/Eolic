@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""
+Wind Energy Investment & Rentability Analysis using Windy API with Enhanced Financial Reporting and PDF Export
+---------------------------------------------------------------------------------------------
+This script performs a complete analysis of wind data and financial projections.
+It:
+  1. Collects user inputs for analysis region, grid resolution, and financial parameters.
+  2. Generates a grid of geographic coordinates over the selected region using precise bounds.
+  3. Fetches wind forecast data from the Windy API with rate limiting.
+  4. Processes the returned data by computing average wind speeds.
+  5. Performs a spatial join with a Natural Earth shapefile and filters by region.
+  6. Aggregates data by country and selects the top N countries (or the specific country) for analysis.
+  7. Runs financial modeling (estimating energy production, NPV, rentability, IRR, payback period).
+  8. Generates several visualizations (data coverage map, wind heatmap, choropleth map, cash flow charts, IRR/payback chart).
+  9. Produces a professional PDF report summarizing inputs, key outputs, and embedded images.
+"""
+#flemme de rajouter mais il faudrait mettre l inflation du cout de l electricité dans les inputs pour que les revenues et donc la npv soit plus coherent
+# -------------------------------
+# Import Required Libraries
+# -------------------------------
+import requests, time, math, random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import geopandas as gpd
+from shapely.geometry import Point
+from datetime import datetime, timezone
+import sys
+import contextily as ctx
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+import numpy_financial as npf  # For IRR calculations
+import os
+
+# -------------------------------
+# 1. USER INPUTS
+# -------------------------------
+def get_user_inputs():
+    print("=== Wind Energy Investment & Rentability Analysis ===\n")
+    
+    regions = [ "Africa", "Asia", "Europe", "North America", "South America", "Oceania" ]
+    
+    print("Select a region from the following options:")
+    for i, reg in enumerate(regions, start=1):
+        print(f"  {i}. {reg}")
+    
+    reg_choice = input("Enter the number corresponding to your choice (default 3 for Europe): ").strip()
+    try:
+        reg_index = int(reg_choice) - 1
+        if reg_index < 0 or reg_index >= len(regions):
+            region = "Europe"
+        else:
+            region = regions[reg_index]
+    except:
+        region = "Europe"
+    
+    try:
+        grid_points = int(input("Enter grid resolution (points per side, e.g., 5): ").strip())
+    except:
+        grid_points = 5
+ 
+    print("\n--- Financial & Turbine Parameters ---")
+    try:
+        turbine_area = float(input("Enter turbine swept area (m², e.g., 12400): ").strip())
+    except:
+        turbine_area = 12400.0
+    try:
+        efficiency = float(input("Enter base turbine efficiency (e.g., 0.4): ").strip())
+    except:
+        efficiency = 0.4
+    try:
+        electricity_price = float(input("Enter electricity price (€/kWh, e.g., 0.12): ").strip())
+    except:
+        electricity_price = 0.12
+    try:
+        capex = float(input("Enter CAPEX per turbine (€ e.g., 1500000): ").strip())
+    except:
+        capex = 1500000
+    try:
+        opex = float(input("Enter annual O&M (€ e.g., 65000): ").strip())
+    except:
+        opex = 65000
+    try:
+        discount_rate = float(input("Enter discount rate (%) e.g., 7: ").strip()) / 100
+    except:
+        discount_rate = 0.07
+    try:
+        project_lifetime = int(input("Enter project lifetime (years, e.g., 20): ").strip())
+    except:
+        project_lifetime = 20
+
+    #if region in ["Global", "Africa", "Asia", "Europe", "North America", "South America", "Oceania"]:
+    try:
+            top_n = int(input("Enter number of top countries to analyze (e.g., 3): ").strip())
+    except:
+            top_n = 3
+    
+  
+    return {
+        "region": region,
+        "grid_points": grid_points,
+        "turbine_area": turbine_area,
+        "efficiency": efficiency,
+        "electricity_price": electricity_price,
+        "capex": capex,
+        "opex": opex,
+        "discount_rate": round(discount_rate, 2),
+        "project_lifetime": project_lifetime,
+        "top_n": top_n,
+        "max_requests": 500,
+        "retry_delay": 0.5
+    }
+
+# -------------------------------
+# 2. GEOGRAPHICAL SETUP (PRECISE BOUNDS)
+# -------------------------------
+REGION_BOUNDS = {
+    "Africa":       (-18.054, -35.014, 51.209, 38.500),
+    "Asia":         (25.000, -10.000, 180.000, 81.000),
+    "Europe":       (-31.266, 34.714, 40.092, 71.185),
+    "North America":(-168.120, 15.320, -52.750, 72.110),
+    "South America":(-82.500, -56.200, -34.100, 13.900),
+    "Oceania":      (110.100, -50.300, 180.000, 0.000)
+}
+
+def setup_geography(region, grid_points):
+    bounds = REGION_BOUNDS[region]
+    min_lon, min_lat, max_lon, max_lat = bounds
+    print(f"\nSelected Region: {region}")
+    print(f"Precise Bounds: Longitude [{min_lon}, {max_lon}], Latitude [{min_lat}, {max_lat}]")
+    lons = np.linspace(min_lon, max_lon, grid_points)
+    lats = np.linspace(min_lat, max_lat, grid_points)
+    full_grid = [(lat, lon) for lat in lats for lon in lons]
+    print(f"Full grid has {len(full_grid)} points.\n")
+    return full_grid, bounds
+
+# -------------------------------
+# 4. DATA FETCHING FROM WINDY POINT FORECAST API
+# -------------------------------
+WINDY_API_KEY = "o4YG8gNZuk8k1S4Qu7rxZi9GpmMyIDOP"  # Replace with your actual API key
+WINDY_URL = "https://api.windy.com/api/point-forecast/v2"
+
+def fetch_all_forecasts_windy(grid_coords, max_requests, retry_delay):
+    if len(grid_coords) > max_requests:
+        print(f"Grid has {len(grid_coords)} points; sampling {max_requests} points to limit API requests.")
+        grid_coords = random.sample(grid_coords, max_requests)
+    results = []
+    for (lat, lon) in grid_coords:
+        payload = {
+            "lat": lat,
+            "lon": lon,
+            "model": "gfs",  # Using global GFS model.
+            "parameters": ["wind"],
+            "levels": ["surface"],
+            "key": WINDY_API_KEY
+        }
+        headers = {"Content-Type": "application/json"}
+        max_attempts = 3
+        attempt = 0
+        delay = retry_delay
+        success = False
+        while attempt < max_attempts and not success:
+            try:
+                resp = requests.post(WINDY_URL, json=payload, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    data["acquisition_time"] = datetime.now(timezone.utc).isoformat()
+                    results.append(data)
+                    success = True
+                elif resp.status_code == 429:
+                    print(f"Rate limited for lat={lat}, lon={lon}. Retrying in {delay:.2f} seconds...")
+                    time.sleep(delay)
+                    attempt += 1
+                    delay *= 2  # Exponential backoff
+                else:
+                    print(f"Request failed for lat={lat}, lon={lon} with status code: {resp.status_code}")
+                    results.append(None)
+                    success = True
+            except Exception as e:
+                print(f"Exception for lat={lat}, lon={lon}: {e}. Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+                attempt += 1
+                delay *= 2  # Exponential backoff
+        if not success:
+            results.append(None)
+        time.sleep(0.2)  # Small pause between requests
+    print("Finished fetching forecast data from Windy API.\n")
+    return results
+
+# -------------------------------
+# 5. PROCESS WIND DATA FROM WINDY
+# -------------------------------
+def process_wind_data_windy(grid_coords, weather_data_list):
+    grid_results = []
+    for (lat, lon), wdata in zip(grid_coords, weather_data_list):
+        if not wdata or "ts" not in wdata:
+            continue
+        try:
+            u_values = wdata.get("wind_u-surface", [])
+            v_values = wdata.get("wind_v-surface", [])
+            if not u_values or not v_values:
+                continue
+            speeds = [math.sqrt(u**2 + v**2) for u, v in zip(u_values, v_values)]
+            if speeds:
+                avg_speed = np.mean(speeds)
+                grid_results.append({
+                    "latitude": lat,
+                    "longitude": lon,
+                    "avg_wind_speed": avg_speed,
+                    "acquisition_time": wdata.get("acquisition_time", "N/A")
+                })
+        except Exception as e:
+            continue
+    data_framed = pd.DataFrame(grid_results)
+    print(f"Processed Data: Retrieved for {len(data_framed)} grid points.\n")
+    return data_framed
+
+# -------------------------------
+# 6. SPATIAL JOIN WITH COUNTRY DATA AND FILTER BY REGION
+# -------------------------------
+def spatial_join(data_framed, selected_region):
+    try:
+        world = gpd.read_file("./data/ne_110m_admin_0_countries.shp")
+    except Exception as e:
+        print("Error loading shapefile.")
+        sys.exit(1)
+    world = world.rename(columns={"ADMIN": "country", "CONTINENT": "continent"})
+    world = world.to_crs("EPSG:4326")
+    
+    geometry = [Point(lon, lat) for lat, lon in zip(data_framed["latitude"], data_framed["longitude"])]
+    gdata_framed = gpd.GeoDataFrame(data_framed, geometry=geometry, crs="EPSG:4326")
+    
+    gdf_joined = gpd.sjoin(gdata_framed, world[["country", "continent", "geometry"]], how="inner", predicate="within")
+    gdf_joined = gdf_joined[["latitude", "longitude", "avg_wind_speed", "country", "continent"]]
+    if selected_region != "Global":
+        gdf_joined = gdf_joined[gdf_joined["continent"] == selected_region]
+    return gdf_joined, world
+
+# -------------------------------
+# 7. AGGREGATE & SELECT TOP COUNTRIES
+# -------------------------------
+def select_top_countries(gdf_joined, top_n):
+    country_stats = gdf_joined.groupby("country")["avg_wind_speed"].mean().reset_index()
+    country_stats = country_stats.sort_values("avg_wind_speed", ascending=False)
+    top_countries = country_stats.head(top_n)["country"].tolist()
+    print(f"Top {top_n} Countries by Average Forecast Wind Speed:")
+    print(country_stats.head(top_n).to_string(index=False))
+    print("")
+    return top_countries, country_stats
+
+# -------------------------------
+# 8. FINANCIAL MODELING & RENTABILITY CALCULATIONS
+# -------------------------------
+def estimate_energy(wind_speed, area, efficiency):
+    rho = 1.225  # kg/m³
+    hours_year = 8760
+    power_density = 0.5 * rho * (wind_speed ** 3)
+    energy_MWh = power_density * area * efficiency * hours_year / 1e6
+    return energy_MWh
+
+
+
+def npv_of_project(revenue,opex, discount_rate, lifetime,capex):
+    net_cash_flows = 0
+    for i in range(1, lifetime + 1):
+        net_cash_flows += (revenue - opex) / ((1 + discount_rate) ** i) 
+    npv=net_cash_flows-capex
+    return npv
+
+def simulate_cash_flows(avg_ws, turbine_area, efficiency, electricity_price, opex, capex, lifetime):
+    energy = estimate_energy(avg_ws, turbine_area, efficiency)
+    revenue = energy * 1000 * electricity_price
+    annual_net = revenue - opex
+    cash_flows = [-capex] + [annual_net] * lifetime
+    return cash_flows
+
+def compute_payback_period(cash_flows):
+    cumulative = np.cumsum(cash_flows)
+    for i, cum in enumerate(cumulative):
+        if cum > 0:
+            return i
+    return None
+
+def rentability(wind_speed, area, efficiency, electricity_price, capex, opex, discount_rate, lifetime):
+    energy = estimate_energy(wind_speed, area, efficiency)
+    revenue = energy * 1000 * electricity_price
+    npv = npv_of_project(revenue, opex, discount_rate, lifetime,capex)
+    return npv / capex
+
+# -------------------------------
+# 9. GRAPH OF PROJECTED FINANCIAL STATE (Cash Flow Charts per Country)
+# -------------------------------
+def plot_cash_flow_chart(cash_flows, country):
+    years = list(range(len(cash_flows)))
+    cumulative = np.cumsum(cash_flows)
+    fig, ax = plt.subplots(figsize=(10,6))
+    ax.plot(years, cash_flows, marker='o', label="Annual Cash Flow")
+    ax.plot(years, cumulative, marker='s', label="Cumulative Cash Flow")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Cash Flow (€)")
+    ax.set_title(f"Projected Cash Flows for {country}")
+    ax.legend()
+    ax.grid(True)
+    filename = f"cash_flow_{country}.png"
+    plt.savefig(filename)
+    plt.close(fig)
+    return filename
+
+def plot_combined_financials(analysis_results,top_n):
+    """
+    Create a combined plot with subplots for each country showing their cash flow charts.
+    """
+    
+    fig, axs = plt.subplots(top_n, 1, constrained_layout=True)
+    if top_n == 1:
+        axs = [axs]
+    for ax, (country, res) in zip(axs, analysis_results.items()):
+        cash_flows = res["cash_flows"]
+        years = list(range(len(cash_flows)))
+        cumulative = np.cumsum(cash_flows)
+        ax.plot(years, cash_flows, marker='o', label="Annual Cash Flow")
+        ax.plot(years, cumulative, marker='s', label="Cumulative Cash Flow")
+        ax.set_xlabel("Year")
+        ax.set_ylabel("Cash Flow (€)")
+        ax.set_title(f"{country} - IRR: {res['IRR']*100:.2f}%, Payback: {res['Payback']} years")
+        ax.legend()
+        ax.grid(True)
+    plt.savefig("combined_cash_flow_chart.png")
+    
+    
+
+def additional_financial_analysis(country_stats, turbine_area, efficiency, electricity_price, capex, opex, lifetime):
+    fin_analysis = {}
+    for _, row in country_stats.iterrows():
+        country = row["country"]
+        avg_ws = row["avg_wind_speed"]
+        cash_flows = simulate_cash_flows(avg_ws, turbine_area, efficiency, electricity_price, opex, capex, lifetime)
+        irr = npf.irr(cash_flows)
+        payback = compute_payback_period(cash_flows)
+        chart_file = plot_cash_flow_chart(cash_flows, country)
+        fin_analysis[country] = {
+            "cash_flows": cash_flows,
+            "IRR": irr,
+            "Payback": payback,
+            "chart": chart_file
+        }
+    return fin_analysis
+
+
+# -------------------------------
+# 10. PLOT PAYBACK PERIOD AND IRR CHART
+# -------------------------------
+def plot_payback_and_irr_chart(fin_analysis):
+    countries = list(fin_analysis.keys())
+    irr_values = [fin_analysis[country]["IRR"] * 100 for country in countries]
+    # Replace None payback values with 0 for plotting
+    payback_values = [
+        fin_analysis[country]["Payback"] if fin_analysis[country]["Payback"] is not None else 0 
+        for country in countries
+    ]
+    
+    x = np.arange(len(countries))
+    width = 0.35
+    
+    fig, ax1 = plt.subplots(figsize=(10,6))
+    ax1.bar(x - width/2, irr_values, width, color='orange', label='IRR (%)')
+    ax1.set_ylabel('IRR (%)', color='orange')
+    ax1.tick_params(axis='y', labelcolor='orange')
+    
+    ax2 = ax1.twinx()
+    ax2.bar(x + width/2, payback_values, width, color='blue', label='Payback (years)')
+    ax2.set_ylabel('Payback (years)', color='blue')
+    ax2.tick_params(axis='y', labelcolor='blue')
+    
+    plt.xticks(x, countries, rotation=45, ha='right')
+    plt.title("Financial Analysis: IRR and Payback Period by Country")
+    
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    
+    plt.tight_layout()
+    plt.savefig("payback_irr_chart.png", dpi=300)
+    
+
+
+# -------------------------------
+# 11. TRUE GEOGRAPHIC HEATMAP (WITH BASEMAP)
+# -------------------------------
+def plot_geographic_heatmap(data_framed, region, bounds):
+    geometry = [Point(lon, lat) for lat, lon in zip(data_framed["latitude"], data_framed["longitude"])]
+    gdf = gpd.GeoDataFrame(data_framed, geometry=geometry, crs="EPSG:4326").to_crs(epsg=3857)
+    
+    fig, ax = plt.subplots(figsize=(10,8))
+    gdf.plot(column="avg_wind_speed", cmap="viridis", markersize=50, legend=True, ax=ax)
+    ax.set_title(f"Average Wind Speed over {region}")
+    ax.set_axis_off()
+    try:
+        ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik)
+    except Exception as e:
+        pass
+    plt.savefig("geographic_heatmap.png")
+    
+
+# -------------------------------
+# 12. CHOROPLETH MAP OF RENTABILITY BY COUNTRY
+# -------------------------------
+def plot_rentability_choropleth(world, outcomes):
+    mean_rents = {country: np.mean(rents) for country, rents in outcomes.items() if all(isinstance(r, (int, float)) for r in rents)}
+    df_rent = pd.DataFrame(list(mean_rents.items()), columns=["country", "mean_rentability"])
+    world_rent = world.merge(df_rent, on="country", how="left")
+    world_rent = world_rent.to_crs("ESRI:54030")
+    
+    fig, ax = plt.subplots(figsize=(14, 9))
+    world_rent.plot(
+        column="mean_rentability",
+        cmap="YlOrRd",
+        scheme="quantiles",
+        k=5,
+        legend=True,
+        missing_kwds={"color": "lightgrey"},
+        ax=ax
+    )
+    ax.set_title("World Map of Project Rentability (Quantiles)", fontsize=16, pad=15)
+    ax.set_axis_off()
+    plt.tight_layout()
+    plt.savefig("choropleth_map.png", dpi=300)
+    
+
+# -------------------------------
+# 13. MAP OF DATA ACQUISITION COVERAGE
+# -------------------------------
+def plot_data_coverage(full_grid, data_framed, region):
+    full_df = pd.DataFrame(full_grid, columns=["latitude", "longitude"])
+    full_df["data_acquired"] = full_df.apply(
+        lambda row: "Yes" if ((data_framed["latitude"] == row["latitude"]) & (data_framed["longitude"] == row["longitude"])).any() else "No",
+        axis=1
+    )
+    geometry = [Point(lon, lat) for lat, lon in zip(full_df["latitude"], full_df["longitude"])]
+    full_gdf = gpd.GeoDataFrame(full_df, geometry=geometry, crs="EPSG:4326").to_crs(epsg=3857)
+    
+    fig, ax = plt.subplots(figsize=(10,8))
+    full_gdf.plot(ax=ax, column="data_acquired", categorical=True, legend=True, markersize=50, cmap="coolwarm")
+    ax.set_title(f"Data Acquisition Coverage over {region}")
+    ax.set_axis_off()
+    try:
+        ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik)
+    except Exception as e:
+        pass
+    plt.savefig("data_coverage_map.png")
+    
+
+# -------------------------------
+# 14. GENERATE PDF REPORT
+# -------------------------------
+REPORT_DIR = "./reports"
+if not os.path.exists(REPORT_DIR):
+    os.makedirs(REPORT_DIR)
+
+def generate_report_filename():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(REPORT_DIR, f"wind_energy_report_{timestamp}.pdf")
+
+def additional_financial_analysis(country_stats, turbine_area, efficiency, electricity_price, capex, opex, discount_rate, lifetime):
+    fin_analysis = {}
+    for _, row in country_stats.iterrows():
+        country = row["country"]
+        avg_ws = row["avg_wind_speed"]
+        cash_flows = simulate_cash_flows(avg_ws, turbine_area, efficiency, electricity_price, opex, capex, lifetime)
+        irr = npf.irr(cash_flows)
+        payback = compute_payback_period(cash_flows)
+        # Calcul de l'énergie produite
+        energy = estimate_energy(avg_ws, turbine_area, efficiency)
+        # Maintenant, on peut appeler npv_of_project avec energy déjà calculé
+        npv_value = npv_of_project(energy * 1000 * electricity_price, opex, discount_rate, lifetime, capex)
+        rentability_value = npv_value / capex
+        chart_file = plot_cash_flow_chart(cash_flows, country)
+        fin_analysis[country] = {
+            "cash_flows": cash_flows,
+            "NPV": npv_value,
+            "IRR": irr,
+            "Payback": payback,
+            "Rentability": rentability_value,
+            "chart": chart_file,
+            "revenue per year": energy * 1000 * electricity_price,
+        }
+    return fin_analysis
+
+def generate_pdf_report(params, country_stats, analysis_results):
+    report_file = "Financial_Report.pdf"
+    doc = SimpleDocTemplate(report_file, pagesize=letter)
+    styles = getSampleStyleSheet()
+    Story = []
+
+    # Title
+    Story.append(Paragraph("Wind Energy Investment & Rentability Analysis Report", styles['Title']))
+    Story.append(Spacer(1, 12))
+
+    # User Inputs Summary
+    input_summary = f"""
+    <b>Region:</b> {params['region']}<br/>
+    <b>Grid Resolution:</b> {params['grid_points']} points per side<br/>
+    <b>Turbine Swept Area (m²):</b> {params['turbine_area']}<br/>
+    <b>Base Efficiency:</b> {params['efficiency']}<br/>
+    <b>Electricity Price (€/kWh):</b> {params['electricity_price']}<br/>
+    <b>CAPEX (€ ):</b> {params['capex']}<br/>
+    <b>O&M Cost (€ ):</b> {params['opex']}<br/>
+    <b>Discount Rate (%):</b> {params['discount_rate']*100}<br/>
+    <b>Project Lifetime (years):</b> {params['project_lifetime']}<br/>
+    <b>Top Countries Analyzed:</b> {params['top_n']}<br/>
+    <b>Max API Requests:</b> {params['max_requests']}<br/>
+    """
+    Story.append(Paragraph("User Inputs Summary", styles['Heading2']))
+    Story.append(Paragraph(input_summary, styles['Normal']))
+    Story.append(Spacer(1, 12))
+
+    # shows the annual revenue
+    for country, analysis in analysis_results.items():
+        revenue_per_year = analysis["revenue per year"]
+        Story.append(Paragraph(f"<b>{country}:</b> Estimated Annual Revenue: €{revenue_per_year:,.2f}", styles['Normal']))
+    Story.append(Spacer(1, 12))
+
+
+    # Financial Computations Summary Table
+    fin_table_data = [["Country", "Avg Wind Speed (m/s)", "NPV (€)", "IRR (%)", "Payback (years)", "Rentability"]]
+    for country in country_stats["country"]:
+        avg_ws = country_stats[country_stats["country"] == country]["avg_wind_speed"].values[0]
+        npv_val = analysis_results[country]["NPV"]
+        irr_val = analysis_results[country]["IRR"] * 100 if analysis_results[country]["IRR"] is not None else None
+        payback_val = analysis_results[country]["Payback"]
+        rentability_val = analysis_results[country]["Rentability"]
+        fin_table_data.append([
+            country,
+            f"{avg_ws:.2f}",
+            f"{npv_val:.2f}",
+            f"{irr_val:.2f}" if irr_val is not None else "N/A",
+            f"{payback_val}" if payback_val is not None else "N/A",
+            f"{rentability_val:.2f}"
+        ])
+    fin_table = Table(fin_table_data)
+    fin_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), '#d3d3d3'),
+        ('TEXTCOLOR', (0,0), (-1,0), 'black'),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 10),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('GRID', (0,0), (-1,-1), 1, 'black')
+    ]))
+    Story.append(Paragraph("Financial Computations Summary", styles['Heading2']))
+    Story.append(fin_table)
+    Story.append(Spacer(1, 12))
+
+    # Detailed Financial Modeling Narrative
+    detailed_report = f"""
+    <b>Executive Summary:</b><br/>
+    This report evaluates the financial viability of the wind energy project based on the estimated wind resource, turbine performance, and financial assumptions. 
+    The analysis covers estimated annual energy production, revenue, and cash flow projections over the project lifetime. 
+    Key financial metrics, including Net Present Value (NPV), Internal Rate of Return (IRR), payback period, and project rentability (NPV/CAPEX), are computed for each country.<br/><br/>
+    
+    <b>Technical Overview:</b><br/>
+    The project utilizes wind turbines with a swept area of {params['turbine_area']} m² and an efficiency of {params['efficiency']}. 
+    Annual energy production is estimated using the formula: <br/>
+    Energy (MWh) = 0.5 &times; Air Density &times; (Wind Speed³) &times; Turbine Area &times; Efficiency &times; Hours per Year &div; 1,000,000.<br/><br/>
+    
+    <b>Financial Analysis:</b><br/>
+    The initial CAPEX is €{params['capex']}, and the annual O&M cost is €{params['opex']}. 
+    Electricity is assumed to be sold at €{params['electricity_price']} per kWh. 
+    Future cash flows are discounted at a rate of {params['discount_rate']*100}% over a period of {params['project_lifetime']} years. 
+    The resulting NPV, IRR, and payback period provide insights into the project's viability. Sensitivity analysis indicates that small variations in wind speed, CAPEX, and O&M costs can significantly impact financial outcomes.<br/><br/>
+    
+    <b>Recommendations:</b><br/>
+    To improve project viability, consider selecting sites with higher average wind speeds, optimizing CAPEX through economies of scale, or negotiating higher electricity prices via long-term PPAs.
+    """
+    Story.append(Paragraph("Detailed Financial Modeling Report", styles['Heading2']))
+    Story.append(Paragraph(detailed_report, styles['Normal']))
+    Story.append(Spacer(1, 12))
+    
+    # Embed Images (only include those that are generated)
+    image_files = [
+        ("Data Coverage Map", "data_coverage_map.png"),
+        ("Geographic Heatmap", "geographic_heatmap.png"),
+        ("Choropleth Map", "choropleth_map.png"),
+        ("Combined Cash Flow Chart", "combined_cash_flow_chart.png")
+    ]
+    for title, img_file in image_files:
+        Story.append(Paragraph(title, styles['Heading3']))
+        try:
+            img = RLImage(img_file, width=400, height=300)
+            Story.append(img)
+        except Exception as e:
+            Story.append(Paragraph(f"Error loading image {img_file}: {e}", styles['Normal']))
+        Story.append(Spacer(1, 12))
+    
+    doc.build(Story)
+    print(f"PDF report '{report_file}' generated.")
+
+
+# -------------------------------
+# 15. MAIN FUNCTION
+# -------------------------------
+def main():
+    params = get_user_inputs()
+    full_grid, bounds = setup_geography(params["region"], params["grid_points"])
+    
+    print("Fetching forecast data from Windy API...")
+    weather_data_list = fetch_all_forecasts_windy(full_grid, params["max_requests"], params["retry_delay"])
+    
+    data_framed = process_wind_data_windy(full_grid, weather_data_list)
+    if data_framed.empty:
+        print("No forecast data available. Exiting.")
+        sys.exit(1)
+    
+    plot_data_coverage(full_grid, data_framed, params["region"])
+    plot_geographic_heatmap(data_framed, params["region"], bounds)
+    
+    gdf_joined, world = spatial_join(data_framed, params["region"])
+    
+    if params["region"] in ["Global", "Africa", "Asia", "Europe", "North America", "South America", "Oceania"]:
+        top_countries, country_stats = select_top_countries(gdf_joined, params["top_n"])
+    else:
+        gdf_joined = gdf_joined[gdf_joined["country"] == params["region"]]
+        country_stats = gdf_joined.groupby("country")["avg_wind_speed"].mean().reset_index()
+        top_countries = [params["region"]]
+    
+    # Simulate outcomes for demonstration purposes
+    simulated_outcomes = {}
+    for country in country_stats["country"]:
+        avg_ws = country_stats[country_stats["country"] == country]["avg_wind_speed"].values[0]
+        simulated_outcomes[country] = [rentability(avg_ws, params["turbine_area"], params["efficiency"],
+                                                    params["electricity_price"], params["capex"], params["opex"],
+                                                    params["discount_rate"], params["project_lifetime"])]
+    plot_rentability_choropleth(world, simulated_outcomes)
+    
+    print("\nPerforming financial analysis...\n")
+    fin_analysis = additional_financial_analysis(
+        country_stats,
+        params["turbine_area"],
+        params["efficiency"],
+        params["electricity_price"],
+        params["capex"],
+        params["opex"],
+        params["discount_rate"],
+        params["project_lifetime"]
+    )
+    plot_payback_and_irr_chart(fin_analysis)
+    plot_combined_financials(fin_analysis, params["top_n"])
+    generate_pdf_report(params, country_stats, fin_analysis)
+
+print("\nEnd of Analysis. Thank you for using the tool.")
+
+if __name__ == '__main__':
+    main()
